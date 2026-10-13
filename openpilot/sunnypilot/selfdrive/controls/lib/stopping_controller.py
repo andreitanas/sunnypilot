@@ -67,10 +67,10 @@ class StoppingController:
   BLEND_V = 10.0 / 3.6  # m/s
   END_V_HI = 5.0 / 3.6  # m/s
   END_HI = -0.65  # m/s^2
-  END_LO = -0.30  # m/s^2
+  END_LO = -0.15  # m/s^2
 
   END_CURVE_V = [0.0, 1.0 / 3.6, 2.0 / 3.6, 3.0 / 3.6, 4.0 / 3.6, 5.0 / 3.6]  # m/s
-  END_CURVE_A = [END_LO, (END_LO + -0.56) / 2, -0.56, -0.60, -0.65, END_HI]  # m/s^2
+  END_CURVE_A = [END_LO, (END_LO + -0.45) / 2, -0.45, -0.58, -0.65, END_HI]  # m/s^2
   END_PLAN_MIN = -0.25  # m/s^2
   END_RATE = 2.0  # m/s^3
   END_CAP_RATE = 1.0  # m/s^3
@@ -78,7 +78,8 @@ class StoppingController:
 
   END_CAP_V = [0.0, 2.0 / 3.6, 4.0 / 3.6, 6.0 / 3.6, 8.0 / 3.6, 10.0 / 3.6]  # m/s
   END_CAP_A = [END_LO, -0.45, -0.65, -0.95, -1.25, -1.55]  # m/s^2
-  LEAD_END_FLOOR = END_LO  # m/s^2
+  LEAD_END_FLOOR = -0.30  # m/s^2
+  LEAD_END_FLOOR_V = 2.0 / 3.6  # m/s
 
   RELEASE_FAST = 4.0  # m/s^3
   RELEASE_SLOW = 1.5  # m/s^3
@@ -137,12 +138,14 @@ class StoppingController:
       # a lead sets the end of the stop (and the gap), so follow the plan's own ease down to the wheel stop. The line
       # used to floor this and held a plan easing to -0.15 at the line's -0.65 (seg 13), firming the last few metres.
       # LEAD_END_FLOOR keeps that from going the other way and dissolving the stop into a creep.
-      target = min(a_target, self.LEAD_END_FLOOR) if a_target < 0.0 else a_target
+      floor = float(np.interp(max(v_ego, 0.0), [0.0, self.LEAD_END_FLOOR_V], [self.END_LO, self.LEAD_END_FLOOR]))
+      target = min(a_target, floor) if a_target < 0.0 else a_target
     else:
       line = self._blend(v_ego)
       target = min(self._end_cap(a_target, v_ego), line)  # soften a firm free stop; the line still floors it
       if v_ego < self.END_V_HI and target < line:
-        return float(min(line, prev_accel + self.END_CAP_RATE * DT_CTRL))
+        step = self.END_CAP_RATE * DT_CTRL
+        return float(np.clip(line, prev_accel - step, prev_accel + step))
     step = self.END_RATE * DT_CTRL
     return float(np.clip(target, prev_accel - step, prev_accel + step))
 
@@ -175,7 +178,7 @@ class StoppingController:
       return False
     self.cf_t += DT_CTRL
     self.cf_vmax = max(self.cf_vmax, CS.vEgo)
-    if self.cf_t > self.CF_WINDOW or self.cf_vmax >= self.CF_V_MAX or a_target > 0.0 and self.cf_stopping:
+    if self.cf_t > self.CF_WINDOW or self.cf_vmax >= self.CF_V_MAX or (a_target > 0.0 and self.cf_stopping):
       self.cf_t, self.cf_stopping = None, False
       return False
     if a_target <= self.CF_TRIGGER:

@@ -7,6 +7,8 @@ See the LICENSE.md file in the root directory for more details.
 import math
 from types import SimpleNamespace
 
+import numpy as np
+
 from openpilot.common.realtime import DT_CTRL
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
@@ -33,6 +35,12 @@ def blend(sc, v_kph):
   return sc._blend(v_kph / 3.6)
 
 
+def lead_floor(sc, v_kph):
+  """the lead stop's terminal floor: LEAD_END_FLOOR above LEAD_END_FLOOR_V, tapering to END_LO at the wheel stop"""
+  return float(np.interp(v_kph / 3.6, [0.0, StoppingController.LEAD_END_FLOOR_V],
+                         [StoppingController.END_LO, StoppingController.LEAD_END_FLOOR]))
+
+
 class TestEndOfStop(OpenpilotTestCase):
   """the line is the free-stop (no lead) finish: it runs from the entry request through 5 km/h to the rest value,
   and floors a plan that is already easing. A stop with a lead follows the plan instead (TestLeadStop)."""
@@ -48,11 +56,12 @@ class TestEndOfStop(OpenpilotTestCase):
     # 5 km/h and below: the line eases from END_HI through its knots toward the rest value, then END_LO at the wheel stop
     out = run(sc, PID, cs(5.0), -0.20, out, 0.4, has_lead=False)
     assert abs(out - END_HI) < 1e-6
+    knots = StoppingController.END_CURVE_A
     out = run(sc, PID, cs(2.5), -0.20, out, 0.4, has_lead=False)
-    assert abs(out - (-0.56 + -0.60) / 2) < 1e-6  # halfway between the 2 and 3 km/h knots of the line
+    assert abs(out - (knots[2] + knots[3]) / 2) < 1e-6  # halfway between the 2 and 3 km/h knots of the line
     assert abs(blend(sc, 4.0) - END_HI) < 1e-6
-    assert abs(blend(sc, 3.0) - (-0.60)) < 1e-6 and abs(blend(sc, 1.0) - (-0.43)) < 1e-6
-    assert abs(blend(sc, 0.5) - ((END_LO + -0.43) / 2)) < 1e-6  # halfway between the 0 and 1 km/h knots
+    assert abs(blend(sc, 3.0) - knots[3]) < 1e-6 and abs(blend(sc, 1.0) - knots[1]) < 1e-6
+    assert abs(blend(sc, 0.5) - (knots[0] + knots[1]) / 2) < 1e-6  # halfway between the 0 and 1 km/h knots
     out = run(sc, PID, cs(0.0), -0.20, out, 0.4, has_lead=False)
     assert abs(out - END_LO) < 1e-6
 
@@ -150,14 +159,19 @@ class TestLeadStop(OpenpilotTestCase):
     assert abs(out - StoppingController.LEAD_END_FLOOR) < 1e-6
     assert out < -0.15                                                # firmer than the plan
     assert out > sc._blend(4.0 / 3.6)                                 # ...but never firmer than the line did
-    # a plan that eases right down to the wheel stop still holds the floor, not the plan
+    # a plan that eases right down to the wheel stop still holds the floor, not the plan. Below LEAD_END_FLOOR_V the
+    # floor itself tapers toward END_LO, so the request is the taper there, not the full LEAD_END_FLOOR
     out = self._step(sc, 1.0, StoppingController.END_LO / 2, out)
-    assert abs(out - StoppingController.LEAD_END_FLOOR) < 1e-6
+    assert abs(out - lead_floor(sc, 1.0)) < 1e-6
+    assert lead_floor(sc, 1.0) > StoppingController.LEAD_END_FLOOR
 
-  def test_the_floor_is_never_firmer_than_the_line_it_replaced(self):
+  def test_the_floor_is_a_taper_that_never_firms_past_the_line(self):
     sc = StoppingController(-2.0)
-    for v_kph in (0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 8.0):
-      assert StoppingController.LEAD_END_FLOOR >= sc._blend(v_kph / 3.6)
+    assert abs(lead_floor(sc, 0.0) - StoppingController.END_LO) < 1e-9              # rests on the line's rest value
+    assert abs(lead_floor(sc, 2.0) - StoppingController.LEAD_END_FLOOR) < 1e-9      # full floor by LEAD_END_FLOOR_V
+    for v_kph in (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 8.0):
+      assert lead_floor(sc, v_kph) >= sc._blend(v_kph / 3.6)  # never firmer than the line the stop used to be held at
+    assert lead_floor(sc, 0.5) > lead_floor(sc, 2.0)          # ...and it tapers as the wheels stop
 
   def test_a_moving_lead_is_still_followed(self):
     sc = StoppingController(-2.0)
@@ -259,7 +273,8 @@ class TestRerollHold(OpenpilotTestCase):
 
   def test_steps_to_the_reroll_request_within_0_1s(self):
     outs = self._reroll(StoppingController(-2.0))
-    assert outs[4] <= StoppingController.REROLL_ACCEL + 1e-9   # 0.05 s
+    # the step reaches REROLL_ACCEL within 0.1 s, then the creep rate keeps digging past it to arrest the roll
+    assert outs[9] <= StoppingController.REROLL_ACCEL + 1e-9
     assert all(b - a >= -StoppingController.REROLL_JERK * DT_CTRL - 1e-9 for a, b in zip(outs, outs[1:], strict=False))
 
 
@@ -411,3 +426,12 @@ class TestFreeStopCap(OpenpilotTestCase):
     out = self._step(sc, 3.0, -1.8, False, -0.9)
     assert out >= StoppingController.END_CAP_A[3] - 1e-6              # never softer than the cap
     assert out > -1.8
+
+  def test_coming_up_onto_the_line_is_rate_limited_both_ways(self):
+    # below END_V_HI a firm plan puts the cap firmer than the line, so the request comes up onto the line. It must ramp
+    # there, not jump: the cap rate bounds the request in both directions
+    sc = StoppingController(-2.0)
+    assert sc._end_cap(-1.5, 4.5 / 3.6) < sc._blend(4.5 / 3.6)  # the branch below is actually taken at 4.5 km/h
+    out = self._step(sc, 4.5, -1.5, False, -0.40, secs=DT_CTRL)
+    assert abs(out - (-0.40 - StoppingController.END_CAP_RATE * DT_CTRL)) < 1e-6
+    assert out > sc._blend(4.5 / 3.6)  # still short of the line after one tick, instead of jumping to it
