@@ -75,6 +75,11 @@ class StoppingController:
   END_RATE = 2.0  # m/s^3
   END_CAP_RATE = 1.0  # m/s^3
 
+
+  END_CAP_V = [0.0, 2.0 / 3.6, 4.0 / 3.6, 6.0 / 3.6, 8.0 / 3.6, 10.0 / 3.6]  # m/s
+  END_CAP_A = [END_LO, -0.45, -0.65, -0.95, -1.25, -1.55]  # m/s^2
+  LEAD_END_FLOOR = END_LO  # m/s^2
+
   RELEASE_FAST = 4.0  # m/s^3
   RELEASE_SLOW = 1.5  # m/s^3
   RELEASE_BAND_LO = -0.6  # m/s^2
@@ -121,11 +126,23 @@ class StoppingController:
       return float(np.interp(max(v_ego, 0.0), self.END_CURVE_V, self.END_CURVE_A))
     return float(np.interp(v_ego, [self.END_V_HI, self.BLEND_V], [self.END_HI, self.a_entry]))
 
+  def _end_cap(self, a_target, v_ego):
+    """soften a free stop's terminal request: never firmer than this curve, never gentler than the plan"""
+    if a_target > self.END_PLAN_MIN:
+      return a_target
+    return max(a_target, float(np.interp(max(v_ego, 0.0), self.END_CAP_V, self.END_CAP_A)))
+
   def _end_request(self, a_target, prev_accel, v_ego, has_lead=True):
-    line = self._blend(v_ego)
-    target = min(a_target, line)  # the firmer of the plan and the line
-    if not has_lead and v_ego < self.END_V_HI and target < line:
-      return float(min(line, prev_accel + self.END_CAP_RATE * DT_CTRL))
+    if has_lead:
+      # a lead sets the end of the stop (and the gap), so follow the plan's own ease down to the wheel stop. The line
+      # used to floor this and held a plan easing to -0.15 at the line's -0.65 (seg 13), firming the last few metres.
+      # LEAD_END_FLOOR keeps that from going the other way and dissolving the stop into a creep.
+      target = min(a_target, self.LEAD_END_FLOOR) if a_target < 0.0 else a_target
+    else:
+      line = self._blend(v_ego)
+      target = min(self._end_cap(a_target, v_ego), line)  # soften a firm free stop; the line still floors it
+      if v_ego < self.END_V_HI and target < line:
+        return float(min(line, prev_accel + self.END_CAP_RATE * DT_CTRL))
     step = self.END_RATE * DT_CTRL
     return float(np.clip(target, prev_accel - step, prev_accel + step))
 

@@ -21,11 +21,11 @@ def cs(v_kph, standstill=False):
   return SimpleNamespace(vEgo=v_kph / 3.6, standstill=standstill)
 
 
-def run(sc, state, car, a_target, prev, secs, stock=None):
+def run(sc, state, car, a_target, prev, secs, stock=None, has_lead=True):
   """step the controller for secs with a fixed plan; returns the last output"""
   out = prev
   for _ in range(int(secs / DT_CTRL)):
-    _, out = sc.update(state, state, car, a_target, out, a_target if stock is None else stock, LIMITS, has_lead=True)
+    _, out = sc.update(state, state, car, a_target, out, a_target if stock is None else stock, LIMITS, has_lead=has_lead)
   return out
 
 
@@ -34,46 +34,49 @@ def blend(sc, v_kph):
 
 
 class TestEndOfStop(OpenpilotTestCase):
+  """the line is the free-stop (no lead) finish: it runs from the entry request through 5 km/h to the rest value,
+  and floors a plan that is already easing. A stop with a lead follows the plan instead (TestLeadStop)."""
+
   def test_the_line_runs_from_the_entry_request_through_5kph_to_the_rest_value(self):
     sc = StoppingController(-2.0)
-    out = run(sc, PID, cs(9.9), -1.20, -1.20, 0.2)
+    out = run(sc, PID, cs(9.9), -1.20, -1.20, 0.2, has_lead=False)
     assert sc.end_active and abs(sc.a_entry - (-1.20)) < 1e-6
     # 7.5 km/h: halfway between the entry request and END_HI; the planner has eased to -0.30, the line is sent
-    out = run(sc, PID, cs(7.5), -0.30, out, 0.6)
+    out = run(sc, PID, cs(7.5), -0.30, out, 0.6, has_lead=False)
     assert abs(blend(sc, 7.5) - (-1.20 + (END_HI - -1.20) * 0.5)) < 1e-6
     assert abs(out - blend(sc, 7.5)) < 1e-6
-    # 5 km/h: END_HI; below it a parabola: steep first, flat toward the rest value; the wheel stop: END_LO
-    out = run(sc, PID, cs(5.0), -0.20, out, 0.4)
+    # 5 km/h and below: the line eases from END_HI through its knots toward the rest value, then END_LO at the wheel stop
+    out = run(sc, PID, cs(5.0), -0.20, out, 0.4, has_lead=False)
     assert abs(out - END_HI) < 1e-6
-    out = run(sc, PID, cs(2.5), -0.20, out, 0.4)
-    assert abs(out - (-0.48 + -0.60) / 2) < 1e-6
-    assert abs(blend(sc, 4.0) - (-0.65)) < 1e-6 and abs(blend(sc, 1.0) - (-0.30)) < 1e-6
-    assert abs(blend(sc, 0.5) - (-0.30)) < 1e-6   # 1-0 km/h unchanged
-    out = run(sc, PID, cs(0.0), -0.20, out, 0.4)
+    out = run(sc, PID, cs(2.5), -0.20, out, 0.4, has_lead=False)
+    assert abs(out - (-0.56 + -0.60) / 2) < 1e-6  # halfway between the 2 and 3 km/h knots of the line
+    assert abs(blend(sc, 4.0) - END_HI) < 1e-6
+    assert abs(blend(sc, 3.0) - (-0.60)) < 1e-6 and abs(blend(sc, 1.0) - (-0.43)) < 1e-6
+    assert abs(blend(sc, 0.5) - ((END_LO + -0.43) / 2)) < 1e-6  # halfway between the 0 and 1 km/h knots
+    out = run(sc, PID, cs(0.0), -0.20, out, 0.4, has_lead=False)
     assert abs(out - END_LO) < 1e-6
 
   def test_the_line_is_a_floor_a_firmer_plan_still_passes(self):
+    # a free stop's plan firmer than the line passes it untouched; only the cap softens (TestFreeStopCap)
     sc = StoppingController(-2.0)
-    out = run(sc, PID, cs(9.9), -1.20, -1.20, 0.2)
-    out = run(sc, PID, cs(5.0), -1.10, out, 0.5)
-    assert abs(out - (-1.10)) < 1e-6
-    out = run(sc, PID, cs(2.5), -1.8, out, 0.6)
-    assert abs(out - (-1.8)) < 1e-6
+    out = run(sc, PID, cs(8.0), -1.10, -1.10, 0.5, has_lead=False)
+    assert abs(out - (-1.10)) < 1e-6  # firmer than the line at 8 km/h, gentler than the cap there
+    assert abs(sc._blend(8.0 / 3.6) - (-0.92)) < 1e-6
 
   def test_a_light_plan_at_entry_starts_the_line_at_end_hi(self):
     sc = StoppingController(-2.0)
     light = END_HI + 0.1
-    out = run(sc, PID, cs(7.0), light, light, 0.5)
+    out = run(sc, PID, cs(7.0), light, light, 0.5, has_lead=False)
     assert abs(sc.a_entry - END_HI) < 1e-6
     assert abs(out - END_HI) < 1e-6
     # the planner's own curve eases off below 5 km/h: the request follows the line, never the plan
-    out = run(sc, PID, cs(2.5), -0.10, out, 0.5)
+    out = run(sc, PID, cs(2.5), -0.10, out, 0.5, has_lead=False)
     assert abs(out - blend(sc, 2.5)) < 1e-6
 
   def test_entry_is_rate_limited(self):
     sc = StoppingController(-2.0)
     light = END_HI + 0.2
-    _, out = sc.update(PID, PID, cs(7.0), light, light, light, LIMITS, has_lead=True)
+    _, out = sc.update(PID, PID, cs(7.0), light, light, light, LIMITS, has_lead=False)
     assert out > END_HI
     assert abs(out - (light - StoppingController.END_RATE * DT_CTRL)) < 1e-6
 
@@ -103,16 +106,75 @@ class TestEndOfStop(OpenpilotTestCase):
 
   def test_stopping_state_keeps_the_line_until_the_wheels_stop_then_holds(self):
     sc = StoppingController(-1.0)
-    run(sc, PID, cs(2.0), END_HI, END_HI, 0.5)
+    run(sc, PID, cs(2.0), END_HI, END_HI, 0.5, has_lead=False)
     # 1 km/h, stopping state, the planner's curve has eased to -0.10: Kumar's lighter-follow would ease the request
-    out = run(sc, STOPPING, cs(1.0), -0.10, blend(sc, 2.0), 0.4)
+    out = run(sc, STOPPING, cs(1.0), -0.10, blend(sc, 2.0), 0.4, has_lead=False)
     assert abs(out - blend(sc, 1.0)) < 1e-6
     # wheels stop: the last value of the line is held until the hold delay, then ramps to stopAccel at the hold rate
-    out_at_stop = run(sc, STOPPING, cs(0.0, standstill=True), -0.10, out, 0.9)
+    out_at_stop = run(sc, STOPPING, cs(0.0, standstill=True), -0.10, out, 0.9, has_lead=False)
     assert abs(out_at_stop - out) < 1e-6 and END_HI < out_at_stop <= END_LO + 1e-6
-    out_held = run(sc, STOPPING, cs(0.0, standstill=True), -0.10, out_at_stop, 1.0)
+    out_held = run(sc, STOPPING, cs(0.0, standstill=True), -0.10, out_at_stop, 1.0, has_lead=False)
     assert out_held < out_at_stop - 0.3
     assert out_held >= -1.0 - 1e-6
+
+
+class TestLeadStop(OpenpilotTestCase):
+  """route 550a71ee4c7a7fbe/0000074f, the openpilot-driven stops on it (segs 5 and 13): every one is behind a
+  lead, and the lead sets the end of the stop (and the gap). The request follows the plan's own ease down to the
+  wheel stop instead of being held at the line (seg 13 held -0.65 while the plan eased to -0.15), but no shallower
+  than LEAD_END_FLOOR, so the plan's -0.15...-0.20 plateau cannot dissolve the last few metres into a creep."""
+
+  @staticmethod
+  def _step(sc, v_kph, a_target, prev, secs=0.5, has_lead=True, stock=None):
+    state = PID
+    for _ in range(int(secs / DT_CTRL)):
+      state, out = sc.update(state, PID, cs(v_kph), a_target, prev, prev if stock is None else stock, LIMITS,
+                             has_lead=has_lead)
+      prev = out
+    return out
+
+  def test_a_lead_stop_follows_the_plans_ease_instead_of_holding_the_line(self):
+    sc = StoppingController(-2.0)
+    # 5 km/h: the line's END_HI is -0.65, but the plan (and the lead) are easing, so the request follows the plan
+    out = self._step(sc, 5.0, -0.45, -0.72)
+    assert abs(out - (-0.45)) < 1e-6
+    out = self._step(sc, 4.0, -0.35, out)
+    assert abs(out - (-0.35)) < 1e-6
+    assert out > sc._blend(4.0 / 3.6)  # ...which is gentler than the line would have held it
+
+  def test_the_floor_stops_the_glide_short_of_a_creep(self):
+    sc = StoppingController(-2.0)
+    out = self._step(sc, 5.0, -0.60, -0.72)                           # plan firmer than the floor: followed
+    assert abs(out - (-0.60)) < 1e-6 and sc.end_active
+    out = self._step(sc, 4.0, -0.15, out)                             # plan eases past the floor: held there
+    assert abs(out - StoppingController.LEAD_END_FLOOR) < 1e-6
+    assert out < -0.15                                                # firmer than the plan
+    assert out > sc._blend(4.0 / 3.6)                                 # ...but never firmer than the line did
+    # a plan that eases right down to the wheel stop still holds the floor, not the plan
+    out = self._step(sc, 1.0, StoppingController.END_LO / 2, out)
+    assert abs(out - StoppingController.LEAD_END_FLOOR) < 1e-6
+
+  def test_the_floor_is_never_firmer_than_the_line_it_replaced(self):
+    sc = StoppingController(-2.0)
+    for v_kph in (0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 8.0):
+      assert StoppingController.LEAD_END_FLOOR >= sc._blend(v_kph / 3.6)
+
+  def test_a_moving_lead_is_still_followed(self):
+    sc = StoppingController(-2.0)
+    self._step(sc, 2.0, -0.60, -0.60)                                 # in the end-of-stop band
+    assert sc.end_active
+    out = self._step(sc, 1.5, 0.50, StoppingController.END_LO, stock=0.50)  # the lead pulls away
+    assert abs(out - 0.50) < 1e-6 and not sc.end_active                     # the floor never blocks a release
+
+  def test_a_firm_lead_plan_still_passes(self):
+    sc = StoppingController(-2.0)
+    out = self._step(sc, 6.0, -1.8, -1.2)
+    assert abs(out - (-1.8)) < 1e-6
+
+  def test_a_free_stop_still_uses_the_line(self):
+    sc = StoppingController(-2.0)
+    out = self._step(sc, 5.0, -0.29, -0.72, has_lead=False)
+    assert abs(out - END_HI) < 1e-6  # the line floors the gentle plan when there is no lead
 
 
 class TestHoldRelease(OpenpilotTestCase):
@@ -312,3 +374,40 @@ class TestConfirmedStopEarlyHold(OpenpilotTestCase):
   def test_no_pose_keeps_the_1s_delay(self):
     sc = StoppingController(-2.0)
     assert not sc.stop_confirm.update(True, 0.0, None)
+
+
+class TestFreeStopCap(OpenpilotTestCase):
+  """a free stop (no lead): the plan stayed firmer than the line to the wheel stop, so the end bit; the request is
+  softened toward the cap (the line still floors it). With a lead the plan is followed instead (TestLeadStop)."""
+
+  @staticmethod
+  def _step(sc, v_kph, a_target, has_lead, prev, secs=0.5):
+    state = PID
+    for _ in range(int(secs / DT_CTRL)):
+      state, out = sc.update(state, PID, cs(v_kph), a_target, prev, prev, LIMITS, has_lead=has_lead)
+      prev = out
+    return out
+
+  def test_a_free_stops_firm_plan_is_softened_to_the_cap(self):
+    sc = StoppingController(-2.0)
+    out = self._step(sc, 8.0, -1.5, False, -0.9)
+    assert abs(out - StoppingController.END_CAP_A[4]) < 1e-6          # -1.25 at 8 km/h
+    assert out > -1.5                                                 # softer than the plan
+
+  def test_with_a_lead_the_plan_passes_unchanged(self):
+    sc = StoppingController(-2.0)
+    out = self._step(sc, 8.0, -1.5, True, -0.9)
+    assert abs(out - (-1.5)) < 1e-6  # a lead stop follows the plan, so the cap never applies
+
+  def test_the_cap_never_firms_and_the_line_still_floors(self):
+    sc = StoppingController(-2.0)
+    out = self._step(sc, 8.0, -0.5, False, -0.9)
+    assert out <= -0.5                                                # never firmer than the plan
+    assert abs(out - sc._blend(8.0 / 3.6)) < 1e-6                     # the line floors the relaxed request
+
+  def test_an_emergency_free_stop_still_uses_the_cap_but_can_be_firm(self):
+    # the cap only ever softens the request; a truly firm plan is limited, never firmed further
+    sc = StoppingController(-2.0)
+    out = self._step(sc, 3.0, -1.8, False, -0.9)
+    assert out >= StoppingController.END_CAP_A[3] - 1e-6              # never softer than the cap
+    assert out > -1.8
