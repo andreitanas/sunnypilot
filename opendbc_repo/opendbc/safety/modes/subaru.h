@@ -37,6 +37,9 @@
 
 #define MSG_SUBARU_ES_UDS_Request        0x787U
 
+#define MSG_SUBARU_Dashlights            0x390U
+#define MSG_SUBARU_AVH_Request           0x6bbU
+
 #define MSG_SUBARU_ES_HighBeamAssist     0x22AU
 #define MSG_SUBARU_ES_STATIC_1           0x325U
 #define MSG_SUBARU_ES_STATIC_2           0x121U
@@ -68,6 +71,12 @@
 #define SUBARU_STOP_AND_GO_TX_MSGS \
   {MSG_SUBARU_Throttle,          SUBARU_CAM_BUS,  8, .check_relay = true}, \
   {MSG_SUBARU_Brake_Pedal,       SUBARU_CAM_BUS,  8, .check_relay = true}, \
+
+// feature memory (gen2): copies of the car's own AVH request and Auto Start Stop button messages,
+// sent alongside the real sender, so the relay check doesn't apply
+#define SUBARU_FEATURE_MEMORY_TX_MSGS \
+  {MSG_SUBARU_Dashlights,        SUBARU_ALT_BUS,  8, .check_relay = false}, \
+  {MSG_SUBARU_AVH_Request,       SUBARU_ALT_BUS,  8, .check_relay = false}, \
 
 #define SUBARU_COMMON_RX_CHECKS(alt_bus)                                                                                                         \
   {.msg = {{MSG_SUBARU_Throttle,        SUBARU_MAIN_BUS, 8, 100U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
@@ -207,6 +216,18 @@ static bool subaru_tx_hook(const CANPacket_t *msg) {
     violation |= !(is_tester_present || is_button_rdbi);
   }
 
+  // feature memory: these copies may only carry a button press, either exactly one AVH request (bit 0 = off, bit 1 = on)...
+  if (msg->addr == MSG_SUBARU_AVH_Request) {
+    int avh_request = msg->data[2] & 0x3U;
+    violation |= (avh_request != 1) && (avh_request != 2);
+  }
+
+  // ...or the Auto Start Stop button
+  if (msg->addr == MSG_SUBARU_Dashlights) {
+    bool stop_start_button = (msg->data[6] >> 6) & 1U;
+    violation |= !stop_start_button;
+  }
+
   if (violation){
     tx = false;
   }
@@ -241,6 +262,12 @@ static safety_config subaru_init(uint16_t param) {
     SUBARU_STOP_AND_GO_TX_MSGS
   };
 
+  static const CanMsg subaru_gen2_feature_memory_tx_msgs[] = {
+    SUBARU_BASE_TX_MSGS(SUBARU_ALT_BUS, MSG_SUBARU_ES_LKAS)
+    SUBARU_COMMON_TX_MSGS(SUBARU_ALT_BUS)
+    SUBARU_FEATURE_MEMORY_TX_MSGS
+  };
+
   static RxCheck subaru_rx_checks[] = {
     SUBARU_COMMON_RX_CHECKS(SUBARU_MAIN_BUS)
   };
@@ -262,8 +289,9 @@ static safety_config subaru_init(uint16_t param) {
 
   safety_config ret;
   if (subaru_gen2) {
-    ret = subaru_longitudinal ? BUILD_SAFETY_CFG(subaru_gen2_rx_checks, SUBARU_GEN2_LONG_TX_MSGS) : \
-                                BUILD_SAFETY_CFG(subaru_gen2_rx_checks, SUBARU_GEN2_TX_MSGS);
+    ret = subaru_longitudinal   ? BUILD_SAFETY_CFG(subaru_gen2_rx_checks, SUBARU_GEN2_LONG_TX_MSGS) : \
+          subaru_feature_memory ? BUILD_SAFETY_CFG(subaru_gen2_rx_checks, subaru_gen2_feature_memory_tx_msgs) : \
+                                  BUILD_SAFETY_CFG(subaru_gen2_rx_checks, SUBARU_GEN2_TX_MSGS);
   } else {
     ret = subaru_longitudinal ? BUILD_SAFETY_CFG(subaru_rx_checks, SUBARU_LONG_TX_MSGS) : \
           subaru_stop_and_go  ? BUILD_SAFETY_CFG(subaru_rx_checks, subaru_stop_and_go_tx_msgs) : \

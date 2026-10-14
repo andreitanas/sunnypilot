@@ -10,10 +10,16 @@
 extern bool subaru_stop_and_go;
 bool subaru_stop_and_go = false;
 
+extern bool subaru_feature_memory;
+bool subaru_feature_memory = false;
+
 void subaru_common_init(void) {
   const uint16_t SUBARU_PARAM_SP_STOP_AND_GO = 1;
 
   subaru_stop_and_go = GET_FLAG(current_safety_param_sp, SUBARU_PARAM_SP_STOP_AND_GO);
+
+  const uint16_t SUBARU_PARAM_SP_FEATURE_MEMORY = 2;
+  subaru_feature_memory = GET_FLAG(current_safety_param_sp, SUBARU_PARAM_SP_FEATURE_MEMORY);
 }
 
 /*
