@@ -1,0 +1,592 @@
+From d065103f4128b1f344d12bf076011f3b2cea870f Mon Sep 17 00:00:00 2001
+From: Andrei Tanas <5031276+andreitanas@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 21:42:31 -0700
+Subject: [PATCH] Subaru: remember AVH and Auto Start Stop across restarts
+ (2020-22 Outback/Legacy)
+
+Learns the driver's choice from real button presses and restores it once the engine is running,
+by sending copies of the car's own button messages on the alt bus. Panda safety allows only those
+copies (exactly one AVH request, or the ASS button bit) on the alt bus, behind a new SP safety flag.
+The panda firmware is rebuilt with the change.
+
+Claude-Session: https://claude.ai/code/session_01KsU7SAyanjJ6iGGAXfdCDN
+---
+ .../opendbc/car/subaru/carcontroller.py       |   5 +-
+ opendbc_repo/opendbc/car/subaru/carstate.py   |   9 +-
+ opendbc_repo/opendbc/safety/modes/subaru.h    |  32 ++-
+ .../opendbc/safety/modes/subaru_common.h      |   6 +
+ .../tests/test_subaru_feature_memory.py       |  74 +++++
+ .../opendbc/sunnypilot/car/interfaces.py      |   8 +
+ .../sunnypilot/car/subaru/feature_memory.py   | 265 ++++++++++++++++++
+ .../sunnypilot/car/subaru/values_ext.py       |   2 +
+ 8 files changed, 395 insertions(+), 6 deletions(-)
+ create mode 100644 opendbc_repo/opendbc/safety/tests/test_subaru_feature_memory.py
+ create mode 100644 opendbc_repo/opendbc/sunnypilot/car/subaru/feature_memory.py
+
+diff --git a/opendbc_repo/opendbc/car/subaru/carcontroller.py b/opendbc_repo/opendbc/car/subaru/carcontroller.py
+index fbc55f0..cf6c692 100644
+--- a/opendbc_repo/opendbc/car/subaru/carcontroller.py
++++ b/opendbc_repo/opendbc/car/subaru/carcontroller.py
+@@ -6,6 +6,7 @@ from opendbc.car.interfaces import CarControllerBase
+ from opendbc.car.subaru import subarucan
+ from opendbc.car.subaru.values import DBC, GLOBAL_ES_ADDR, CanBus, CarControllerParams, SubaruFlags
+ 
++from opendbc.sunnypilot.car.subaru.feature_memory import FeatureMemoryCarController
+ from opendbc.sunnypilot.car.subaru.stop_and_go import SnGCarController
+ 
+ # FIXME: These limits aren't exact. The real limit is more than likely over a larger time period and
+@@ -14,10 +15,11 @@ MAX_STEER_RATE = 25  # deg/s
+ MAX_STEER_RATE_FRAMES = 7  # tx control frames needed before torque can be cut
+ 
+ 
+-class CarController(CarControllerBase, SnGCarController):
++class CarController(CarControllerBase, SnGCarController, FeatureMemoryCarController):
+   def __init__(self, dbc_names, CP, CP_SP):
+     CarControllerBase.__init__(self, dbc_names, CP, CP_SP)
+     SnGCarController.__init__(self, CP, CP_SP)
++    FeatureMemoryCarController.__init__(self, CP, CP_SP)
+     self.apply_torque_last = 0
+ 
+     self.cruise_button_prev = 0
+@@ -140,6 +142,7 @@ class CarController(CarControllerBase, SnGCarController):
+           can_sends.append(subarucan.create_es_static_2(self.packer))
+ 
+     can_sends.extend(SnGCarController.create_stop_and_go(self, self.packer, CC, CS, self.frame))
++    can_sends.extend(FeatureMemoryCarController.create_feature_memory(self, CS, self.frame))
+ 
+     new_actuators = actuators.as_builder()
+     new_actuators.torque = self.apply_torque_last / self.p.STEER_MAX
+diff --git a/opendbc_repo/opendbc/car/subaru/carstate.py b/opendbc_repo/opendbc/car/subaru/carstate.py
+index edb11e8..0530b4c 100644
+--- a/opendbc_repo/opendbc/car/subaru/carstate.py
++++ b/opendbc_repo/opendbc/car/subaru/carstate.py
+@@ -6,15 +6,17 @@ from opendbc.car.interfaces import CarStateBase
+ from opendbc.car.subaru.values import DBC, CanBus, SubaruFlags
+ from opendbc.car import CanSignalRateCalculator
+ 
++from opendbc.sunnypilot.car.subaru.feature_memory import FeatureMemoryCarState
+ from opendbc.sunnypilot.car.subaru.mads import MadsCarState
+ from opendbc.sunnypilot.car.subaru.stop_and_go import SnGCarState
+ 
+ 
+-class CarState(CarStateBase, MadsCarState, SnGCarState):
++class CarState(CarStateBase, MadsCarState, SnGCarState, FeatureMemoryCarState):
+   def __init__(self, CP, CP_SP):
+     CarStateBase.__init__(self, CP, CP_SP)
+     MadsCarState.__init__(self, CP, CP_SP)
+     SnGCarState.__init__(self, CP, CP_SP)
++    FeatureMemoryCarState.__init__(self, CP, CP_SP)
+     can_define = CANDefine(DBC[CP.carFingerprint][Bus.pt])
+     self.shifter_values = can_define.dv["Transmission"]["Gear"]
+ 
+@@ -145,13 +147,14 @@ class CarState(CarStateBase, MadsCarState, SnGCarState):
+ 
+     MadsCarState.update_mads(self, ret, can_parsers)
+     SnGCarState.update(self, ret, can_parsers)
++    FeatureMemoryCarState.update_feature_memory(self, can_parsers)
+ 
+     return ret, ret_sp
+ 
+   @staticmethod
+   def get_can_parsers(CP, CP_SP):
+-    return {
++    return FeatureMemoryCarState.add_feature_memory_parser({
+       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CanBus.main),
+       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CanBus.camera),
+       Bus.alt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CanBus.alt)
+-    }
++    }, CP, CP_SP)
+diff --git a/opendbc_repo/opendbc/safety/modes/subaru.h b/opendbc_repo/opendbc/safety/modes/subaru.h
+index c085c72..2999427 100644
+--- a/opendbc_repo/opendbc/safety/modes/subaru.h
++++ b/opendbc_repo/opendbc/safety/modes/subaru.h
+@@ -37,6 +37,9 @@
+ 
+ #define MSG_SUBARU_ES_UDS_Request        0x787U
+ 
++#define MSG_SUBARU_Dashlights            0x390U
++#define MSG_SUBARU_AVH_Request           0x6bbU
++
+ #define MSG_SUBARU_ES_HighBeamAssist     0x22AU
+ #define MSG_SUBARU_ES_STATIC_1           0x325U
+ #define MSG_SUBARU_ES_STATIC_2           0x121U
+@@ -69,6 +72,12 @@
+   {MSG_SUBARU_Throttle,          SUBARU_CAM_BUS,  8, .check_relay = true}, \
+   {MSG_SUBARU_Brake_Pedal,       SUBARU_CAM_BUS,  8, .check_relay = true}, \
+ 
++// feature memory (gen2): copies of the car's own AVH request and Auto Start Stop button messages,
++// sent alongside the real sender, so the relay check doesn't apply
++#define SUBARU_FEATURE_MEMORY_TX_MSGS \
++  {MSG_SUBARU_Dashlights,        SUBARU_ALT_BUS,  8, .check_relay = false}, \
++  {MSG_SUBARU_AVH_Request,       SUBARU_ALT_BUS,  8, .check_relay = false}, \
++
+ #define SUBARU_COMMON_RX_CHECKS(alt_bus)                                                                                                         \
+   {.msg = {{MSG_SUBARU_Throttle,        SUBARU_MAIN_BUS, 8, 100U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+   {.msg = {{MSG_SUBARU_Steering_Torque, SUBARU_MAIN_BUS, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},  \
+@@ -207,6 +216,18 @@ static bool subaru_tx_hook(const CANPacket_t *msg) {
+     violation |= !(is_tester_present || is_button_rdbi);
+   }
+ 
++  // feature memory: these copies may only carry a button press, either exactly one AVH request (bit 0 = off, bit 1 = on)...
++  if (msg->addr == MSG_SUBARU_AVH_Request) {
++    int avh_request = msg->data[2] & 0x3U;
++    violation |= (avh_request != 1) && (avh_request != 2);
++  }
++
++  // ...or the Auto Start Stop button
++  if (msg->addr == MSG_SUBARU_Dashlights) {
++    bool stop_start_button = (msg->data[6] >> 6) & 1U;
++    violation |= !stop_start_button;
++  }
++
+   if (violation){
+     tx = false;
+   }
+@@ -241,6 +262,12 @@ static safety_config subaru_init(uint16_t param) {
+     SUBARU_STOP_AND_GO_TX_MSGS
+   };
+ 
++  static const CanMsg subaru_gen2_feature_memory_tx_msgs[] = {
++    SUBARU_BASE_TX_MSGS(SUBARU_ALT_BUS, MSG_SUBARU_ES_LKAS)
++    SUBARU_COMMON_TX_MSGS(SUBARU_ALT_BUS)
++    SUBARU_FEATURE_MEMORY_TX_MSGS
++  };
++
+   static RxCheck subaru_rx_checks[] = {
+     SUBARU_COMMON_RX_CHECKS(SUBARU_MAIN_BUS)
+   };
+@@ -262,8 +289,9 @@ static safety_config subaru_init(uint16_t param) {
+ 
+   safety_config ret;
+   if (subaru_gen2) {
+-    ret = subaru_longitudinal ? BUILD_SAFETY_CFG(subaru_gen2_rx_checks, SUBARU_GEN2_LONG_TX_MSGS) : \
+-                                BUILD_SAFETY_CFG(subaru_gen2_rx_checks, SUBARU_GEN2_TX_MSGS);
++    ret = subaru_longitudinal   ? BUILD_SAFETY_CFG(subaru_gen2_rx_checks, SUBARU_GEN2_LONG_TX_MSGS) : \
++          subaru_feature_memory ? BUILD_SAFETY_CFG(subaru_gen2_rx_checks, subaru_gen2_feature_memory_tx_msgs) : \
++                                  BUILD_SAFETY_CFG(subaru_gen2_rx_checks, SUBARU_GEN2_TX_MSGS);
+   } else {
+     ret = subaru_longitudinal ? BUILD_SAFETY_CFG(subaru_rx_checks, SUBARU_LONG_TX_MSGS) : \
+           subaru_stop_and_go  ? BUILD_SAFETY_CFG(subaru_rx_checks, subaru_stop_and_go_tx_msgs) : \
+diff --git a/opendbc_repo/opendbc/safety/modes/subaru_common.h b/opendbc_repo/opendbc/safety/modes/subaru_common.h
+index c9e40f4..ef1d57a 100644
+--- a/opendbc_repo/opendbc/safety/modes/subaru_common.h
++++ b/opendbc_repo/opendbc/safety/modes/subaru_common.h
+@@ -10,10 +10,16 @@
+ extern bool subaru_stop_and_go;
+ bool subaru_stop_and_go = false;
+ 
++extern bool subaru_feature_memory;
++bool subaru_feature_memory = false;
++
+ void subaru_common_init(void) {
+   const uint16_t SUBARU_PARAM_SP_STOP_AND_GO = 1;
+ 
+   subaru_stop_and_go = GET_FLAG(current_safety_param_sp, SUBARU_PARAM_SP_STOP_AND_GO);
++
++  const uint16_t SUBARU_PARAM_SP_FEATURE_MEMORY = 2;
++  subaru_feature_memory = GET_FLAG(current_safety_param_sp, SUBARU_PARAM_SP_FEATURE_MEMORY);
+ }
+ 
+ /*
+diff --git a/opendbc_repo/opendbc/safety/tests/test_subaru_feature_memory.py b/opendbc_repo/opendbc/safety/tests/test_subaru_feature_memory.py
+new file mode 100644
+index 0000000..1ff4198
+--- /dev/null
++++ b/opendbc_repo/opendbc/safety/tests/test_subaru_feature_memory.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++import unittest
++
++from opendbc.car.structs import CarParams
++from opendbc.sunnypilot.car.subaru.values_ext import SubaruSafetyFlagsSP
++import opendbc.safety.tests.common as common
++import opendbc.safety.tests.test_subaru as test_subaru  # module import, so pytest doesn't collect its tests here too
++from opendbc.safety.tests.test_subaru import SUBARU_ALT_BUS, SUBARU_CAM_BUS, SUBARU_MAIN_BUS, lkas_tx_msgs
++
++AVH_REQUEST = 0x6bb
++DASHLIGHTS = 0x390
++
++# idle frames recorded on a 2022 Outback
++AVH_REQUEST_IDLE = bytes.fromhex("cd 05 00 01 00 00 06 00")
++DASHLIGHTS_IDLE = bytes.fromhex("cb 05 14 47 7e 5a 00 00")
++
++
++def with_byte(dat: bytes, index: int, value: int) -> bytes:
++  out = bytearray(dat)
++  out[index] = value
++  return bytes(out)
++
++
++class TestSubaruGen2FeatureMemorySafety(test_subaru.TestSubaruGen2TorqueStockLongitudinalSafety):
++  TX_MSGS = lkas_tx_msgs(SUBARU_ALT_BUS) + [[DASHLIGHTS, SUBARU_ALT_BUS], [AVH_REQUEST, SUBARU_ALT_BUS]]
++  SAFETY_PARAM_SP = SubaruSafetyFlagsSP.FEATURE_MEMORY
++
++  def setUp(self):
++    super().setUp()
++    self.safety.set_current_safety_param_sp(self.SAFETY_PARAM_SP)
++    self.safety.set_safety_hooks(CarParams.SafetyModel.subaru, self.FLAGS)
++    self.safety.init_tests()
++
++  def tearDown(self):
++    self.safety.set_current_safety_param_sp(0)
++
++  def _tx_raw(self, addr: int, bus: int, dat: bytes) -> bool:
++    return bool(self.safety.safety_tx_hook(common.make_msg(bus, addr, 8, dat)))
++
++  def _states(self):
++    # the button copies don't depend on engagement or speed
++    for controls_allowed in (False, True):
++      for speed in (0, 30):
++        self.safety.set_controls_allowed(controls_allowed)
++        self.assertTrue(self._rx(self._speed_msg(speed)))
++        yield
++
++  def test_avh_request(self):
++    for _ in self._states():
++      for request, allowed in ((0b00, False), (0b01, True), (0b10, True), (0b11, False)):
++        dat = with_byte(AVH_REQUEST_IDLE, 2, request)
++        self.assertEqual(allowed, self._tx_raw(AVH_REQUEST, SUBARU_ALT_BUS, dat), f"request {request:#04b}")
++
++  def test_ass_button(self):
++    for _ in self._states():
++      for byte6, allowed in ((0x00, False), (0x01, False), (0x40, True), (0x41, True)):
++        dat = with_byte(DASHLIGHTS_IDLE, 6, byte6)
++        self.assertEqual(allowed, self._tx_raw(DASHLIGHTS, SUBARU_ALT_BUS, dat), f"byte 6 = {byte6:#04x}")
++
++  def test_alt_bus_only(self):
++    for bus in (SUBARU_MAIN_BUS, SUBARU_CAM_BUS):
++      self.assertFalse(self._tx_raw(AVH_REQUEST, bus, with_byte(AVH_REQUEST_IDLE, 2, 0b10)))
++      self.assertFalse(self._tx_raw(DASHLIGHTS, bus, with_byte(DASHLIGHTS_IDLE, 6, 0x40)))
++
++
++class TestSubaruGen2WithoutFeatureMemorySafety(test_subaru.TestSubaruGen2TorqueStockLongitudinalSafety):
++  def test_button_copies_blocked(self):
++    for bus in (SUBARU_MAIN_BUS, SUBARU_ALT_BUS, SUBARU_CAM_BUS):
++      self.assertFalse(self.safety.safety_tx_hook(common.make_msg(bus, AVH_REQUEST, 8, with_byte(AVH_REQUEST_IDLE, 2, 0b10))))
++      self.assertFalse(self.safety.safety_tx_hook(common.make_msg(bus, DASHLIGHTS, 8, with_byte(DASHLIGHTS_IDLE, 6, 0x40))))
++
++
++if __name__ == "__main__":
++  unittest.main()
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/interfaces.py b/opendbc_repo/opendbc/sunnypilot/car/interfaces.py
+index 623ad0c..7f72d1f 100644
+--- a/opendbc_repo/opendbc/sunnypilot/car/interfaces.py
++++ b/opendbc_repo/opendbc/sunnypilot/car/interfaces.py
+@@ -17,6 +17,7 @@ from opendbc.car.toyota.values import ToyotaSafetyFlags
+ from opendbc.sunnypilot.car.hyundai.enable_radar_tracks import enable_radar_tracks as hyundai_enable_radar_tracks
+ from opendbc.sunnypilot.car.hyundai.longitudinal.helpers import LongitudinalTuningType
+ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
++from opendbc.sunnypilot.car.subaru import feature_memory as subaru_feature_memory
+ from opendbc.sunnypilot.car.subaru.values_ext import SubaruFlagsSP, SubaruSafetyFlagsSP
+ from opendbc.sunnypilot.car.tesla.values import TeslaFlagsSP
+ from opendbc.sunnypilot.car.toyota.values import ToyotaFlagsSP
+@@ -87,6 +88,7 @@ def setup_interfaces(CI, CP: structs.CarParams, CP_SP: structs.CarParamsSP,
+   _initialize_coop_steering(CP, CP_SP, params_dict)
+   _initialize_radar_tracks(CP, CP_SP, can_recv, can_send)
+   _initialize_stop_and_go(CP, CP_SP, params_dict)
++  _initialize_subaru_feature_memory(CP, CP_SP)
+   _initialize_toyota(CP, CP_SP, params_dict)
+ 
+ 
+@@ -133,6 +135,12 @@ def _initialize_stop_and_go(CP: structs.CarParams, CP_SP: structs.CarParamsSP, p
+       CP_SP.safetyParam |= SubaruSafetyFlagsSP.STOP_AND_GO
+ 
+ 
++def _initialize_subaru_feature_memory(CP: structs.CarParams, CP_SP: structs.CarParamsSP) -> None:
++  if subaru_feature_memory.is_supported(CP) and subaru_feature_memory.is_enabled():
++    CP_SP.flags |= SubaruFlagsSP.FEATURE_MEMORY.value
++    CP_SP.safetyParam |= SubaruSafetyFlagsSP.FEATURE_MEMORY
++
++
+ def _initialize_toyota(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params_dict: dict[str, str]) -> None:
+   if CP.brand == 'toyota':
+     toyota_stock_long = int(params_dict.get("ToyotaEnforceStockLongitudinal", 0)) == 1
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/subaru/feature_memory.py b/opendbc_repo/opendbc/sunnypilot/car/subaru/feature_memory.py
+new file mode 100644
+index 0000000..59cfe70
+--- /dev/null
++++ b/opendbc_repo/opendbc/sunnypilot/car/subaru/feature_memory.py
+@@ -0,0 +1,265 @@
++"""
++Remembers Auto Vehicle Hold (AVH) and Auto Start Stop (ASS) across restarts on 2020-22 Outback/Legacy.
++
++The car turns AVH off and ASS back on at every start. This learns the driver's choice from real button presses
++and, once the engine has been running for a few seconds, restores it by sending copies of the car's own button
++messages on the alt bus, where the brake and engine computers listen. Decoded on a 2022 Outback:
++
++  AVH  status   0x32b byte 5 bit 5 (1 = on)
++       request  0x6bb byte 2: bit 1 = turn on, bit 0 = turn off. Explicit, so repeating it is harmless.
++  ASS  state    0x174 byte 4 bits 7-6: 0 = enabled, 3 = turned off by the driver, 2 = enabled but engine off.
++                The button also works with the engine off, toggling 2 <-> 3.
++       button   0x390 (Dashlights) byte 6 bit 6. The engine computer toggles ASS on every 0 -> 1 edge, and the
++                car sends its own Dashlights (bit = 0) every 50-100 ms, so exactly one pressed frame is sent,
++                right after a real frame, and the car's next frame acts as the release.
++
++All four messages use the standard Subaru checksum (byte 0) and counter (low nibble of byte 1). Copies keep
++every other byte of the latest real frame. The remembered states live in MEMORY_PATH as JSON:
++  {"enabled": true, "avh": true, "ass_off": true}
++Set "enabled" to false to turn the feature off (takes effect at the next start).
++"""
++import json
++import os
++
++from opendbc.can import CANParser
++from opendbc.car import Bus, structs
++from opendbc.car.can_definitions import CanData
++from opendbc.car.carlog import carlog
++from opendbc.car.subaru.values import CAR, DBC, CanBus
++
++from opendbc.sunnypilot.car.subaru.values_ext import SubaruFlagsSP
++
++MEMORY_PATH = os.environ.get("SUBARU_FEATURE_MEMORY_PATH", "/data/media/0/subaru_feature_memory.json")
++SUPPORTED_PLATFORMS = (CAR.SUBARU_OUTBACK, CAR.SUBARU_LEGACY)
++
++AVH_STATUS, AVH_REQUEST = 0x32B, 0x6BB
++ENGINE_STOP_START, DASHLIGHTS = 0x174, 0x390
++WATCHED = (AVH_STATUS, AVH_REQUEST, ENGINE_STOP_START, DASHLIGHTS)
++
++ASS_ENABLED, ASS_ENGINE_OFF, ASS_OFF = 0, 2, 3
++
++# the raw frame tap sits in the CarState parser dict under a key Subaru doesn't otherwise use
++TAP_KEY = Bus.body
++
++# timings in control frames (100 Hz)
++SETTLE_FRAMES = 300     # engine running this long before restoring
++VERIFY_FRAMES = 100     # the state must change this soon after an action
++RETRY_FRAMES = 100      # pause between attempts
++MAX_ATTEMPTS = 3
++LEARN_FRAMES = 100      # read the resulting state this long after a real button press
++AVH_FRAME_GAP = 5       # 50 ms between AVH request frames, like the real burst
++AVH_REQUEST_FRAMES = 4  # the real burst carries the request in its first 4 frames
++
++# freshness limits in parser updates (100 Hz)
++STATUS_MAX_AGE = 50     # 0x32b is 10 Hz, 0x174 is 50 Hz
++AVH_BASE_MAX_AGE = 200  # 0x6bb is only 1 Hz
++
++
++def is_supported(CP: structs.CarParams) -> bool:
++  return CP.carFingerprint in SUPPORTED_PLATFORMS and not CP.openpilotLongitudinalControl
++
++
++def load_memory() -> dict:
++  try:
++    with open(MEMORY_PATH) as f:
++      memory = json.load(f)
++    return memory if isinstance(memory, dict) else {}
++  except (OSError, ValueError):
++    return {}
++
++
++def save_memory(memory: dict) -> None:
++  try:
++    tmp = MEMORY_PATH + ".tmp"
++    with open(tmp, "w") as f:
++      json.dump(memory, f)
++    os.replace(tmp, MEMORY_PATH)
++  except OSError as e:
++    carlog.error(f"subaru feature memory: could not save {MEMORY_PATH}: {e}")
++
++
++def is_enabled() -> bool:
++  return load_memory().get("enabled", True) is not False
++
++
++def subaru_checksum(addr: int, dat: bytes | bytearray) -> int:
++  return ((addr & 0xFF) + ((addr >> 8) & 0xFF) + sum(dat[1:])) & 0xFF
++
++
++def copy_frame(addr: int, dat: bytearray, counter: int) -> CanData:
++  dat[1] = (dat[1] & 0xF0) | (counter & 0xF)
++  dat[0] = subaru_checksum(addr, dat)
++  return CanData(addr, bytes(dat), CanBus.alt)
++
++
++class RawFrameTap(CANParser):
++  """Keeps the raw payloads of a few messages. It registers no DBC messages, so it can't affect CAN validity."""
++  def __init__(self, dbc_name: str, bus: int, addresses: tuple[int, ...]):
++    super().__init__(dbc_name, [], bus)
++    self.latest: dict[int, bytes] = {}
++    self.age: dict[int, int] = {}  # parser updates since the latest frame
++    self.new_frames: dict[int, list[bytes]] = {a: [] for a in addresses}
++
++  def update(self, strings, sendcan: bool = False):
++    if strings and not isinstance(strings[0], list | tuple):
++      strings = [strings]
++
++    for addr in self.age:
++      self.age[addr] += 1
++    for frames in self.new_frames.values():
++      frames.clear()
++
++    for entry in strings:
++      for address, dat, src in entry[1]:
++        if src == self.bus and address in self.new_frames:
++          self.new_frames[address].append(bytes(dat))
++          self.latest[address] = bytes(dat)
++          self.age[address] = 0
++
++    return super().update(strings, sendcan)
++
++  def fresh(self, addr: int, max_age: int) -> bytes | None:
++    return self.latest[addr] if self.age.get(addr, max_age + 1) <= max_age else None
++
++
++class FeatureMemoryCarState:
++  def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP):
++    self.feature_memory_tap: RawFrameTap | None = None
++
++  def update_feature_memory(self, can_parsers) -> None:
++    self.feature_memory_tap = can_parsers.get(TAP_KEY)
++
++  @staticmethod
++  def add_feature_memory_parser(parsers: dict, CP: structs.CarParams, CP_SP: structs.CarParamsSP) -> dict:
++    if CP_SP.flags & SubaruFlagsSP.FEATURE_MEMORY:
++      parsers[TAP_KEY] = RawFrameTap(DBC[CP.carFingerprint][Bus.pt], CanBus.alt, WATCHED)
++    return parsers
++
++
++class RememberedFeature:
++  def __init__(self, name: str, key: str, memory: dict):
++    self.name = name
++    self.key = key
++    desired = memory.get(key)
++    self.desired: bool | None = desired if isinstance(desired, bool) else None
++    self.done = self.desired is None  # nothing to restore until a choice has been learned
++    self.attempts = 0
++    self.next_action_frame = 0
++    self.verify_until: int | None = None
++    self.learn_at: int | None = None
++    self.button_prev = False
++
++  def finish(self, msg: str | None = None) -> None:
++    self.done = True
++    self.verify_until = None
++    if msg:
++      carlog.warning(f"subaru feature memory: {self.name} {msg}")
++
++  def ready_to_act(self, current: bool | None, frame: int) -> bool:
++    """Tracks an ongoing restore. Returns True when a (new) action should be sent now."""
++    if self.done or self.desired is None or current is None or self.learn_at is not None:
++      return False
++    if self.verify_until is not None:
++      if current == self.desired:
++        self.finish(f"restored to {self.desired} after {self.attempts} attempt(s)")
++        return False
++      if frame < self.verify_until:
++        return False
++      self.verify_until = None
++      if self.attempts >= MAX_ATTEMPTS:
++        self.finish(f"gave up restoring to {self.desired} after {self.attempts} attempts")
++        return False
++    if current == self.desired:
++      self.finish()
++      return False
++    return frame >= self.next_action_frame
++
++  def acted(self, frame: int, duration: int = 0) -> None:
++    self.attempts += 1
++    self.verify_until = frame + duration + VERIFY_FRAMES
++    self.next_action_frame = self.verify_until + RETRY_FRAMES
++
++  def saw_button(self, pressed: bool, frame: int) -> None:
++    # a real press: the driver takes over, so stop restoring and learn the result shortly after
++    if pressed and not self.button_prev:
++      self.learn_at = frame + LEARN_FRAMES
++      if not self.done:
++        self.finish("restore cancelled by a real button press")
++    self.button_prev = pressed
++
++  def learn(self, current: bool | None, frame: int, memory: dict) -> None:
++    if self.learn_at is None or frame < self.learn_at:
++      return
++    self.learn_at = None
++    if current is not None and current != self.desired:
++      self.desired = current
++      memory[self.key] = current
++      save_memory(memory)
++      carlog.warning(f"subaru feature memory: remembered {self.name} = {current}")
++
++
++class FeatureMemoryCarController:
++  def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP):
++    self.feature_memory_enabled = bool(CP_SP.flags & SubaruFlagsSP.FEATURE_MEMORY)
++    self.memory = load_memory() if self.feature_memory_enabled else {}
++    self.avh = RememberedFeature("AVH", "avh", self.memory)
++    self.ass_off = RememberedFeature("ASS off", "ass_off", self.memory)
++    self.engine_on_frames = 0
++    self.avh_burst: list[tuple[int, CanData]] = []
++
++  def create_feature_memory(self, CS, frame: int) -> list[CanData]:
++    tap = CS.feature_memory_tap
++    if not self.feature_memory_enabled or tap is None:
++      return []
++
++    status = tap.fresh(AVH_STATUS, STATUS_MAX_AGE)
++    avh_on = bool(status[5] & 0x20) if status is not None else None
++    state = tap.fresh(ENGINE_STOP_START, STATUS_MAX_AGE)
++    ass_state = state[4] >> 6 if state is not None else None
++    ass_off = {ASS_ENABLED: False, ASS_ENGINE_OFF: False, ASS_OFF: True}.get(ass_state) if ass_state is not None else None
++
++    # restore only with the engine running: it's unknown whether a choice made with the engine off survives a start
++    engine_running = ass_state in (ASS_ENABLED, ASS_OFF)
++    self.engine_on_frames = self.engine_on_frames + 1 if engine_running else 0
++
++    # real presses only: our own copies are transmitted, never received, so they don't show up here
++    for dat in tap.new_frames[AVH_REQUEST]:
++      self.avh.saw_button(bool(dat[2] & 0x03), frame)
++    for dat in tap.new_frames[DASHLIGHTS]:
++      self.ass_off.saw_button(bool(dat[6] & 0x40), frame)
++    self.avh.learn(avh_on, frame, self.memory)
++    self.ass_off.learn(ass_off, frame, self.memory)
++
++    can_sends = []
++    if self.engine_on_frames >= SETTLE_FRAMES:
++      if not self.avh_burst and self.avh.ready_to_act(avh_on, frame):
++        self.queue_avh_request(tap, frame)
++      if self.ass_off.ready_to_act(ass_off, frame):
++        can_sends += self.press_ass(tap, frame)
++
++    while self.avh_burst and self.avh_burst[0][0] <= frame:
++      can_sends.append(self.avh_burst.pop(0)[1])
++    return can_sends
++
++  def queue_avh_request(self, tap: RawFrameTap, frame: int) -> None:
++    base = tap.fresh(AVH_REQUEST, AVH_BASE_MAX_AGE)
++    if base is None:
++      return
++    request = 0x02 if self.avh.desired else 0x01
++    counter = base[1] & 0xF
++    for i in range(AVH_REQUEST_FRAMES):
++      dat = bytearray(base)
++      dat[2] = (dat[2] & ~0x03) | request
++      self.avh_burst.append((frame + i * AVH_FRAME_GAP, copy_frame(AVH_REQUEST, dat, counter + 1 + i)))
++    self.avh.acted(frame, AVH_REQUEST_FRAMES * AVH_FRAME_GAP)
++    carlog.warning(f"subaru feature memory: requesting AVH {'on' if self.avh.desired else 'off'} (attempt {self.avh.attempts})")
++
++  def press_ass(self, tap: RawFrameTap, frame: int) -> list[CanData]:
++    # only right after a real Dashlights frame, so the car's next frame releases the button
++    if tap.age.get(DASHLIGHTS) != 0:
++      return []
++    dat = bytearray(tap.latest[DASHLIGHTS])
++    dat[6] |= 0x40
++    self.ass_off.acted(frame)
++    carlog.warning(f"subaru feature memory: pressing ASS to turn it {'off' if self.ass_off.desired else 'on'} (attempt {self.ass_off.attempts})")
++    return [copy_frame(DASHLIGHTS, dat, (dat[1] & 0xF) + 1)]
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/subaru/values_ext.py b/opendbc_repo/opendbc/sunnypilot/car/subaru/values_ext.py
+index 602e5fa..4c29d61 100644
+--- a/opendbc_repo/opendbc/sunnypilot/car/subaru/values_ext.py
++++ b/opendbc_repo/opendbc/sunnypilot/car/subaru/values_ext.py
+@@ -10,8 +10,10 @@ from enum import IntFlag
+ 
+ class SubaruSafetyFlagsSP:
+   STOP_AND_GO = 1
++  FEATURE_MEMORY = 2
+ 
+ 
+ class SubaruFlagsSP(IntFlag):
+   STOP_AND_GO = 1
+   STOP_AND_GO_MANUAL_PARKING_BRAKE = 2
++  FEATURE_MEMORY = 4
+-- 
+2.33.0
+

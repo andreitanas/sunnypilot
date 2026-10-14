@@ -1,0 +1,105 @@
+name: Update release-tizi-feature-memory
+
+# Rebuilds release-tizi-feature-memory whenever sunnypilot publishes a new release-tizi:
+# the release plus feature-memory.patch, with the panda firmware rebuilt to include the patched safety code.
+# If anything fails, nothing is pushed and devices stay on the previous build.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if already based on the latest release"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Build everything but don't push"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-feature-memory
+
+env:
+  UPSTREAM: sunnypilot/sunnypilot
+  RELEASE_BRANCH: release-tizi
+  TARGET_BRANCH: release-tizi-feature-memory
+  GH_TOKEN: ${{ github.token }}
+  GIT_AUTHOR_NAME: Andrei Tanas
+  GIT_AUTHOR_EMAIL: 5031276+andreitanas@users.noreply.github.com
+  GIT_COMMITTER_NAME: github-actions[bot]
+  GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check for a new release
+        id: check
+        run: |
+          upstream=$(git ls-remote "https://github.com/$UPSTREAM.git" "refs/heads/$RELEASE_BRANCH" | cut -f1)
+          base=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TARGET_BRANCH" --jq '.parents[0].sha' 2>/dev/null || true)
+          echo "latest $RELEASE_BRANCH: $upstream, $TARGET_BRANCH is based on: ${base:-nothing}"
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          if [ "$upstream" = "$base" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "up to date"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.check.outputs.build == 'true'
+        with:
+          path: ci
+
+      - name: Fetch the release
+        if: steps.check.outputs.build == 'true'
+        run: |
+          # point this fork's copy of the release branch at the new release. Forks share objects with
+          # upstream, so this is instant, and the push below then only uploads our changes.
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/$RELEASE_BRANCH" \
+            -f sha="${{ steps.check.outputs.upstream }}" -F force=true --silent \
+            || echo "::warning::could not sync $RELEASE_BRANCH, the push will upload the whole release"
+          git init -q sp
+          cd sp
+          git fetch -q --depth=1 "https://github.com/$UPSTREAM.git" "refs/heads/$RELEASE_BRANCH"
+          git checkout -q -b "$TARGET_BRANCH" FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "${{ steps.check.outputs.upstream }}"
+
+      - name: Install the firmware toolchain
+        if: steps.check.outputs.build == 'true'
+        run: |
+          python3 -m venv ~/fw
+          ~/fw/bin/pip install -q scons pycryptodome numpy \
+            "gcc-arm-none-eabi @ git+https://github.com/commaai/dependencies.git@release-gcc-arm-none-eabi#subdirectory=gcc-arm-none-eabi"
+
+      - name: Check the toolchain reproduces the shipped firmware
+        if: steps.check.outputs.build == 'true'
+        working-directory: sp/panda
+        run: |
+          cp board/obj/panda_h7.bin.signed /tmp/shipped.bin.signed
+          GIT_DIR=/nonexistent PATH="$HOME/fw/bin:$PATH" PYTHONPATH="$PWD/../opendbc_repo" scons -j4 board/obj/panda_h7.bin.signed
+          cmp board/obj/panda_h7.bin.signed /tmp/shipped.bin.signed
+          git -C .. checkout -- panda/board/obj
+
+      - name: Apply the patch and build the firmware
+        if: steps.check.outputs.build == 'true'
+        working-directory: sp
+        run: |
+          git am --3way ../ci/feature-memory.patch
+          git diff --name-only HEAD~1 -- '*.py' | xargs ~/fw/bin/python -m py_compile
+          (cd panda && GIT_DIR=/nonexistent PATH="$HOME/fw/bin:$PATH" PYTHONPATH="$PWD/../opendbc_repo" scons -j4 board/obj/panda_h7.bin.signed)
+          git add -u panda/board/obj
+          git commit -q --amend --no-edit
+          git show --stat --format='%h %s' HEAD
+          sha256sum panda/board/obj/panda_h7.bin.signed
+
+      - name: Push
+        if: steps.check.outputs.build == 'true' && inputs.dry_run != true
+        working-directory: sp
+        run: git push --force "https://x-access-token:${GH_TOKEN}@github.com/$GITHUB_REPOSITORY.git" "HEAD:refs/heads/$TARGET_BRANCH"
