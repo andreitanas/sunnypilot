@@ -10,8 +10,10 @@ from enum import IntFlag
 
 class SubaruSafetyFlagsSP:
   STOP_AND_GO = 1
+  FEATURE_MEMORY = 2
 
 
 class SubaruFlagsSP(IntFlag):
   STOP_AND_GO = 1
   STOP_AND_GO_MANUAL_PARKING_BRAKE = 2
+  FEATURE_MEMORY = 4
